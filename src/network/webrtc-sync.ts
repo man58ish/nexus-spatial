@@ -5,6 +5,7 @@ export class WebRTCSync {
   private peerConnection: RTCPeerConnection;
   private dataChannel: RTCDataChannel | null = null;
   private eventSource: EventSource | null = null;
+  private broadcastChannel: BroadcastChannel | null = null;
   
   private isInitiator = false;
   private state: ConnectionState = 'DISCONNECTED';
@@ -15,8 +16,8 @@ export class WebRTCSync {
   private onStateChange: (state: ConnectionState) => void;
   private onPing: (ping: number) => void;
   private pingInterval: number | null = null;
+  private discoveryInterval: number | null = null;
   
-  // ICE candidate queue to prevent mobile network drop
   private pendingCandidates: RTCIceCandidateInit[] = [];
 
   constructor(
@@ -31,13 +32,11 @@ export class WebRTCSync {
     this.onPing = onPing;
     this.peerId = 'peer_' + Math.random().toString(36).substring(2, 9);
 
-    // Multi-Region Global STUN cluster for Mobile NAT Traversal
     this.peerConnection = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
         { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
         { urls: 'stun:global.stun.twilio.com:3478' }
       ]
     });
@@ -47,7 +46,8 @@ export class WebRTCSync {
 
   public init() {
     this.updateState('CONNECTING');
-    this.connectUniversalSignaling();
+    this.initBroadcastChannel();
+    this.initUniversalSignaling();
   }
 
   private updateState(newState: ConnectionState) {
@@ -56,47 +56,69 @@ export class WebRTCSync {
     this.onStateChange(this.state);
   }
 
-  // 100% Reliable HTTPS Signaling (Never blocked by mobile carriers)
-  private connectUniversalSignaling() {
+  // Fast Local-Tab Signaling
+  private initBroadcastChannel() {
+    try {
+      this.broadcastChannel = new BroadcastChannel(`nexus_room_${this.roomId}`);
+      this.broadcastChannel.onmessage = async (e) => {
+        if (e.data && e.data.sender !== this.peerId) {
+          await this.handleIncomingSignal(e.data);
+        }
+      };
+    } catch {}
+  }
+
+  // Universal Cross-Device / Cross-Network HTTPS Signaling
+  private initUniversalSignaling() {
     const topic = `nexus_spatial_${this.roomId}`;
     const sseUrl = `https://ntfy.sh/${topic}/sse`;
 
     try {
       this.eventSource = new EventSource(sseUrl);
 
-      this.eventSource.onopen = () => {
-        // Announce presence across devices
-        this.sendSignal({ type: 'JOIN', sender: this.peerId });
-      };
-
       this.eventSource.onmessage = async (event) => {
         try {
           if (!event.data) return;
-          const parsed = JSON.parse(event.data);
-          
-          // ntfy.sh wraps messages inside 'message' property
-          const rawMessage = parsed.message ? JSON.parse(parsed.message) : parsed;
-          if (!rawMessage || rawMessage.sender === this.peerId) return;
+          const envelope = JSON.parse(event.data);
+          if (envelope.event !== 'message' || !envelope.message) return;
 
-          await this.handleIncomingSignal(rawMessage);
+          const signal = JSON.parse(envelope.message);
+          if (!signal || signal.sender === this.peerId) return;
+
+          await this.handleIncomingSignal(signal);
         } catch {}
       };
 
-      this.eventSource.onerror = () => {
-        // Auto-reconnect managed by EventSource
-      };
+      // Periodic Discovery Broadcast until WebRTC connects
+      this.discoveryInterval = window.setInterval(() => {
+        if (this.state === 'CONNECTED') {
+          if (this.discoveryInterval) clearInterval(this.discoveryInterval);
+          return;
+        }
+        this.sendSignal({ type: 'DISCOVER' });
+      }, 1500);
+
+      this.sendSignal({ type: 'DISCOVER' });
     } catch (e) {
       console.error('Signaling init error:', e);
     }
   }
 
   private async sendSignal(data: object) {
+    const payload = { ...data, sender: this.peerId };
+    const rawString = JSON.stringify(payload);
+
+    // Local Broadcast
+    if (this.broadcastChannel) {
+      try { this.broadcastChannel.postMessage(payload); } catch {}
+    }
+
+    // Global HTTPS POST (Plain Body without conflicting JSON header)
     const topic = `nexus_spatial_${this.roomId}`;
     try {
       await fetch(`https://ntfy.sh/${topic}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...data, sender: this.peerId })
+        body: rawString
       });
     } catch {}
   }
@@ -104,35 +126,40 @@ export class WebRTCSync {
   private async handleIncomingSignal(msg: any) {
     if (this.state === 'CONNECTED') return;
 
-    if (msg.type === 'JOIN') {
-      if (!this.isInitiator && !this.dataChannel) {
-        this.isInitiator = true;
-        this.createDataChannel();
-        const offer = await this.peerConnection.createOffer();
-        await this.peerConnection.setLocalDescription(offer);
-        await this.sendSignal({ type: 'OFFER', sdp: offer });
+    // Deterministic Peer Role Assignment
+    if (msg.type === 'DISCOVER') {
+      if (this.peerId < msg.sender) {
+        if (!this.isInitiator && !this.dataChannel) {
+          this.isInitiator = true;
+          this.createDataChannel();
+          const offer = await this.peerConnection.createOffer();
+          await this.peerConnection.setLocalDescription(offer);
+          await this.sendSignal({ type: 'OFFER', sdp: offer, target: msg.sender });
+        }
       }
     } 
     else if (msg.type === 'OFFER') {
       if (this.isInitiator && this.peerId < msg.sender) return;
       this.isInitiator = false;
-      
+
       await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.sdp));
       await this.flushPendingCandidates();
-      
+
       const answer = await this.peerConnection.createAnswer();
       await this.peerConnection.setLocalDescription(answer);
-      await this.sendSignal({ type: 'ANSWER', sdp: answer });
+      await this.sendSignal({ type: 'ANSWER', sdp: answer, target: msg.sender });
     } 
-    else if (msg.type === 'ANSWER' && this.isInitiator) {
-      if (!this.peerConnection.currentRemoteDescription) {
+    else if (msg.type === 'ANSWER') {
+      if (this.isInitiator && !this.peerConnection.currentRemoteDescription) {
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.sdp));
         await this.flushPendingCandidates();
       }
     } 
     else if (msg.type === 'ICE' && msg.candidate) {
       if (this.peerConnection.remoteDescription && this.peerConnection.remoteDescription.type) {
-        await this.peerConnection.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        try {
+          await this.peerConnection.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } catch {}
       } else {
         this.pendingCandidates.push(msg.candidate);
       }
@@ -189,10 +216,15 @@ export class WebRTCSync {
       this.updateState('CONNECTED');
       this.startPingMonitor();
       
-      // Close signaling stream once direct P2P data channel is running
+      // Teardown signaling pipelines once pure P2P is established
+      if (this.discoveryInterval) clearInterval(this.discoveryInterval);
       if (this.eventSource) {
         this.eventSource.close();
         this.eventSource = null;
+      }
+      if (this.broadcastChannel) {
+        this.broadcastChannel.close();
+        this.broadcastChannel = null;
       }
     };
     
