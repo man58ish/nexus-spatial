@@ -33,8 +33,21 @@ function initEngine(canvas: OffscreenCanvas, w: number, h: number, pr: number) {
   screenW = Math.max(w, 1);
   screenH = Math.max(h, 1);
 
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-  renderer.setPixelRatio(pr || 1); 
+  try {
+    renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: false, // Performance fallback for modest GPUs
+      alpha: false,
+      powerPreference: 'default',
+      failIfMajorPerformanceCaveat: false
+    });
+  } catch (err) {
+    console.error('WebGL Context creation failed in Worker:', err);
+    self.postMessage({ type: 'WEBGL_ERROR', message: 'Hardware acceleration is disabled or unsupported.' });
+    return;
+  }
+
+  renderer.setPixelRatio(Math.min(pr || 1, 2)); 
   renderer.setSize(screenW, screenH, false);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.2;
@@ -63,7 +76,7 @@ function initEngine(canvas: OffscreenCanvas, w: number, h: number, pr: number) {
   grid.position.y = -3;
   scene.add(grid);
 
-  const geometry = new THREE.TorusKnotGeometry(2, 0.6, 256, 32);
+  const geometry = new THREE.TorusKnotGeometry(2, 0.6, 128, 32);
   const material = new THREE.MeshPhysicalMaterial({ 
     color: 0xf8fafc,
     metalness: 0.1,
