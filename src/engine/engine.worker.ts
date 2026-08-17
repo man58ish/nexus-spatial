@@ -33,17 +33,33 @@ function initEngine(canvas: OffscreenCanvas, w: number, h: number, pr: number) {
   screenW = Math.max(w, 1);
   screenH = Math.max(h, 1);
 
+  const contextAttributes: WebGLContextAttributes = {
+    alpha: false,
+    antialias: false,
+    powerPreference: 'high-performance',
+    failIfMajorPerformanceCaveat: false,
+    preserveDrawingBuffer: false
+  };
+
+  // Valid OffscreenCanvas WebGL context IDs
+  const gl = 
+    canvas.getContext('webgl2', contextAttributes) || 
+    canvas.getContext('webgl', contextAttributes);
+
+  if (!gl) {
+    console.error('CRITICAL: WebGL is unsupported or disabled on this GPU.');
+    return;
+  }
+
   try {
     renderer = new THREE.WebGLRenderer({
       canvas,
-      antialias: false, // Performance fallback for modest GPUs
-      alpha: false,
-      powerPreference: 'default',
-      failIfMajorPerformanceCaveat: false
+      context: gl as WebGLRenderingContext,
+      antialias: false,
+      powerPreference: 'high-performance'
     });
   } catch (err) {
-    console.error('WebGL Context creation failed in Worker:', err);
-    self.postMessage({ type: 'WEBGL_ERROR', message: 'Hardware acceleration is disabled or unsupported.' });
+    console.error('THREE.WebGLRenderer Initialization Failed:', err);
     return;
   }
 
