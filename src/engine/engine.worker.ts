@@ -32,38 +32,27 @@ self.onmessage = (e: MessageEvent) => {
 function initEngine(canvas: OffscreenCanvas, w: number, h: number, pr: number) {
   screenW = Math.max(w, 1);
   screenH = Math.max(h, 1);
+  const pixelRatio = Math.min(pr || 1, 2);
 
-  const contextAttributes: WebGLContextAttributes = {
-    alpha: false,
-    antialias: false,
-    powerPreference: 'high-performance',
-    failIfMajorPerformanceCaveat: false,
-    preserveDrawingBuffer: false
-  };
-
-  // Valid OffscreenCanvas WebGL context IDs
-  const gl = 
-    canvas.getContext('webgl2', contextAttributes) || 
-    canvas.getContext('webgl', contextAttributes);
-
-  if (!gl) {
-    console.error('CRITICAL: WebGL is unsupported or disabled on this GPU.');
-    return;
-  }
+  // Set explicit pixel dimensions on the OffscreenCanvas buffer
+  canvas.width = Math.floor(screenW * pixelRatio);
+  canvas.height = Math.floor(screenH * pixelRatio);
 
   try {
     renderer = new THREE.WebGLRenderer({
-      canvas,
-      context: gl as WebGLRenderingContext,
+      canvas: canvas as unknown as HTMLCanvasElement,
       antialias: false,
-      powerPreference: 'high-performance'
+      alpha: false,
+      powerPreference: 'default',
+      precision: 'mediump',
+      failIfMajorPerformanceCaveat: false
     });
   } catch (err) {
-    console.error('THREE.WebGLRenderer Initialization Failed:', err);
+    console.error('Three.js WebGLRenderer instantiation error:', err);
     return;
   }
 
-  renderer.setPixelRatio(Math.min(pr || 1, 2)); 
+  renderer.setPixelRatio(pixelRatio); 
   renderer.setSize(screenW, screenH, false);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.2;
