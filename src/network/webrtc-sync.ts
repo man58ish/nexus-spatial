@@ -5,7 +5,6 @@ export class WebRTCSync {
   private peerConnection: RTCPeerConnection;
   private dataChannel: RTCDataChannel | null = null;
   private ws: WebSocket | null = null;
-  private broadcastChannel: BroadcastChannel | null = null;
   
   private isInitiator = false;
   private state: ConnectionState = 'DISCONNECTED';
@@ -16,6 +15,7 @@ export class WebRTCSync {
   private onStateChange: (state: ConnectionState) => void;
   private onPing: (ping: number) => void;
   private pingInterval: number | null = null;
+  private heartbeatInterval: number | null = null; // ✅ Added property declaration
 
   constructor(
     roomId: string,
@@ -41,8 +41,7 @@ export class WebRTCSync {
 
   public init() {
     this.updateState('CONNECTING');
-    this.initLocalSignaling();
-    this.initGlobalSignaling();
+    this.connectSignaling(); // ✅ Explicitly invoked here
   }
 
   private updateState(newState: ConnectionState) {
@@ -51,103 +50,83 @@ export class WebRTCSync {
     this.onStateChange(this.state);
   }
 
-  // 1. Local Signaling (Instant connection for side-by-side tabs on same PC)
-  private initLocalSignaling() {
-    this.broadcastChannel = new BroadcastChannel(`nexus_room_${this.roomId}`);
-    
-    this.broadcastChannel.onmessage = async (event) => {
-      await this.handleIncomingSignal(event.data, 'local');
-    };
-
-    // Announce presence locally
-    this.broadcastChannel.postMessage({ type: 'JOIN', sender: this.peerId });
-  }
-
-  // 2. Global Signaling (For Cross-Device Phone-to-Laptop connections)
-  private initGlobalSignaling() {
+  private connectSignaling() {
     try {
-      const clusterId = 'room_' + this.roomId.toLowerCase();
-      const apiKey = 'oCdCMcMPQpbvNjUIzqtvF1d2X2okWpDQj4AwARJuAgtjhzKxVEjQU6IdCjwm';
-      this.ws = new WebSocket(`wss://free.blr2.piesocket.com/v3/${clusterId}?api_key=${apiKey}&notify_self=0`);
+      const channelId = 'nexus_' + this.roomId.toLowerCase();
+      const apiKey = 'VCXCEuvhGcBDP7XNJJJUDVxNmNzXVDTB0CsjhSGp';
+      this.ws = new WebSocket(`wss://demo.piesocket.com/v3/${channelId}?api_key=${apiKey}&notify_self=0`);
 
       this.ws.onopen = () => {
-        this.sendGlobalSignal({ type: 'JOIN', sender: this.peerId });
+        this.sendSignal({ type: 'READY', sender: this.peerId });
+        
+        this.heartbeatInterval = window.setInterval(() => {
+          this.sendSignal({ type: 'HEARTBEAT', sender: this.peerId });
+        }, 5000);
       };
 
       this.ws.onmessage = async (event) => {
         try {
           const msg = JSON.parse(event.data);
-          await this.handleIncomingSignal(msg, 'global');
-        } catch (err) {}
+          if (!msg || msg.sender === this.peerId) return;
+
+          if (msg.type === 'READY' || msg.type === 'JOIN') {
+            if (!this.isInitiator && !this.dataChannel) {
+              this.isInitiator = true;
+              this.createDataChannel();
+              const offer = await this.peerConnection.createOffer();
+              await this.peerConnection.setLocalDescription(offer);
+              this.sendSignal({ type: 'OFFER', sdp: offer, sender: this.peerId });
+            }
+          } 
+          else if (msg.type === 'OFFER' && this.isInitiator) {
+            if (this.peerId < msg.sender) return;
+            this.isInitiator = false;
+            await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            const answer = await this.peerConnection.createAnswer();
+            await this.peerConnection.setLocalDescription(answer);
+            this.sendSignal({ type: 'ANSWER', sdp: answer, sender: this.peerId });
+          }
+          else if (msg.type === 'OFFER' && !this.isInitiator) {
+            await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            const answer = await this.peerConnection.createAnswer();
+            await this.peerConnection.setLocalDescription(answer);
+            this.sendSignal({ type: 'ANSWER', sdp: answer, sender: this.peerId });
+          } 
+          else if (msg.type === 'ANSWER' && this.isInitiator) {
+            if (!this.peerConnection.currentRemoteDescription) {
+              await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            }
+          } 
+          else if (msg.type === 'ICE' && msg.candidate) {
+            await this.peerConnection.addIceCandidate(new RTCIceCandidate(msg.candidate));
+          }
+        } catch (err) {
+          console.warn('Signaling parse error:', err);
+        }
       };
-    } catch (e) {}
-  }
 
-  private sendLocalSignal(data: object) {
-    if (this.broadcastChannel) {
-      this.broadcastChannel.postMessage({ ...data, sender: this.peerId });
-    }
-  }
-
-  private sendGlobalSignal(data: object) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ ...data, sender: this.peerId }));
+      this.ws.onerror = (e) => console.warn('WebSocket error:', e);
+    } catch (e) {
+      console.error('Failed signaling:', e);
     }
   }
 
   private sendSignal(data: object) {
-    this.sendLocalSignal(data);
-    this.sendGlobalSignal(data);
-  }
-
-  private async handleIncomingSignal(msg: any, source: string) {
-    if (!msg || msg.sender === this.peerId || this.state === 'CONNECTED') return;
-
-    try {
-      if (msg.type === 'JOIN') {
-        if (!this.isInitiator && !this.dataChannel) {
-          this.isInitiator = true;
-          this.createDataChannel();
-          const offer = await this.peerConnection.createOffer();
-          await this.peerConnection.setLocalDescription(offer);
-          this.sendSignal({ type: 'OFFER', sdp: offer });
-        }
-      } 
-      else if (msg.type === 'OFFER') {
-        if (this.isInitiator && this.peerId < msg.sender) return; // Conflict resolution
-        this.isInitiator = false;
-        if (!this.peerConnection.currentRemoteDescription) {
-          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          const answer = await this.peerConnection.createAnswer();
-          await this.peerConnection.setLocalDescription(answer);
-          this.sendSignal({ type: 'ANSWER', sdp: answer });
-        }
-      } 
-      else if (msg.type === 'ANSWER' && this.isInitiator) {
-        if (!this.peerConnection.currentRemoteDescription) {
-          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-        }
-      } 
-      else if (msg.type === 'ICE' && msg.candidate) {
-        await this.peerConnection.addIceCandidate(new RTCIceCandidate(msg.candidate));
-      }
-    } catch (err) {
-      console.warn(`Signaling error from ${source}:`, err);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data));
     }
   }
 
   private setupPeerEvents() {
     this.peerConnection.onicecandidate = (e) => {
       if (e.candidate) {
-        this.sendSignal({ type: 'ICE', candidate: e.candidate.toJSON() });
+        this.sendSignal({ type: 'ICE', candidate: e.candidate.toJSON(), sender: this.peerId });
       }
     };
-
     this.peerConnection.ondatachannel = (e) => {
       this.dataChannel = e.channel;
       this.bindChannel();
     };
-
     this.peerConnection.onconnectionstatechange = () => {
       if (
         this.peerConnection.connectionState === 'disconnected' ||
@@ -155,6 +134,7 @@ export class WebRTCSync {
       ) {
         this.updateState('DISCONNECTED');
         if (this.pingInterval) clearInterval(this.pingInterval);
+        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
       }
     };
   }
@@ -170,14 +150,13 @@ export class WebRTCSync {
   private bindChannel() {
     if (!this.dataChannel) return;
     this.dataChannel.binaryType = 'arraybuffer';
-    
     this.dataChannel.onopen = () => {
       this.updateState('CONNECTED');
       this.startPingMonitor();
-      
-      // Cleanup signaling channels once direct P2P is established
-      if (this.ws) this.ws.close();
-      if (this.broadcastChannel) this.broadcastChannel.close();
+      if (this.ws) {
+        this.ws.close();
+        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+      }
     };
     
     this.dataChannel.onmessage = (e: MessageEvent) => {
